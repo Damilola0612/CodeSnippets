@@ -1,0 +1,533 @@
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Spreadsheet;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Web;
+
+namespace ERegistry.Core.Services
+{
+    public class ExcelReportService :
+    {
+        public MemoryStream SpreadsheetStream { get; set; } // The stream that the spreadsheet gets returned on
+        private Worksheet currentWorkSheet { get { return spreadSheet.WorkbookPart.WorksheetParts.First().Worksheet; } }
+        private SpreadsheetDocument spreadSheet;
+        private Columns _cols;
+
+        /// <summary>
+        /// Create a basic spreadsheet template 
+        /// The structure of OpenXML spreadsheet is something like this from what I can tell:
+        ///                        Spreadsheet
+        ///                              |         
+        ///                         WorkbookPart    
+        ///                   /         |             \
+        ///           Workbook WorkbookStylesPart WorksheetPart
+        ///                 |          |               |
+        ///            Sheets     StyleSheet        Worksheet
+        ///                |                        /        \       
+        ///          (refers to               SheetData        Columns  
+        ///           Worksheetparts)            |   
+        ///                                     Rows 
+        /// 
+        /// Obviously this only covers the bits in this class!
+        /// </summary>
+        /// <returns></returns>
+        public bool CreateSpreadsheet(string sheetname)
+        {
+            try
+            {
+                SpreadsheetStream = new MemoryStream();
+
+                // Create the spreadsheet on the MemoryStream
+                spreadSheet =
+                         SpreadsheetDocument.Create(SpreadsheetStream, SpreadsheetDocumentType.Workbook);
+
+                WorkbookPart wbp = spreadSheet.AddWorkbookPart();   // Add workbook part
+                WorksheetPart wsp = wbp.AddNewPart<WorksheetPart>(); // Add worksheet part
+                Workbook wb = new Workbook(); // Workbook
+                FileVersion fv = new FileVersion();
+                fv.ApplicationName = "App Name";
+                Worksheet ws = new Worksheet(); // Worksheet
+                SheetData sd = new SheetData(); // Data on worksheet
+
+                // Add stylesheet
+                WorkbookStylesPart stylesPart = spreadSheet.WorkbookPart.AddNewPart<WorkbookStylesPart>();
+                stylesPart.Stylesheet = GenerateStyleSheet();
+                stylesPart.Stylesheet.Save();
+
+
+                _cols = new Columns(); // Created to allow bespoke width columns
+
+                ws.Append(sd); // Add sheet data to worksheet
+                wsp.Worksheet = ws; // Add the worksheet to the worksheet part
+                wsp.Worksheet.Save();
+                // Define the sheets that the workbooks has in it.
+
+                Sheets sheets = new Sheets();
+                Sheet sheet = new Sheet();
+                sheet.Name = sheetname;
+                sheet.SheetId = 1; // Only one sheet per spreadsheet in this class so call it sheet 1
+                sheet.Id = wbp.GetIdOfPart(wsp); // ID of sheet comes from worksheet part
+                sheets.Append(sheet);
+                wb.Append(fv);
+                wb.Append(sheets); // Append sheets to workbook
+
+                spreadSheet.WorkbookPart.Workbook = wb;
+                spreadSheet.WorkbookPart.Workbook.Save();
+
+            }
+            catch
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+
+        /// <summary>
+        /// add the bespoke columns for the list spreadsheet
+        /// </summary>
+        public void CreateColumnWidth(uint startIndex, uint endIndex, double width)
+        {
+            // Find the columns in the worksheet and remove them all
+            if (currentWorkSheet.Where(x => x.LocalName == "cols").Count() > 0)
+                currentWorkSheet.RemoveChild<Columns>(_cols);
+
+            // Create the column
+            Column column = new Column();
+            column.Min = startIndex;
+            column.Max = endIndex;
+            column.Width = width;
+            column.CustomWidth = true;
+            _cols.Append(column); // Add it to the list of columns
+
+            // Make sure that the column info is inserted *before* the sheetdata
+            currentWorkSheet.InsertBefore<Columns>(_cols, currentWorkSheet.Where(x => x.LocalName == "sheetData").First());
+            currentWorkSheet.Save();
+            spreadSheet.WorkbookPart.Workbook.Save();
+
+        }
+
+        /// <summary>
+        /// Close the spreadsheet
+        /// </summary>
+        public void CloseSpreadsheet()
+        {
+            spreadSheet.Close();
+        }
+
+        /// <summary>
+        /// Pass a list of column headings to create the header row
+        /// </summary>
+        /// <param name="headers"></param>
+        public void AddHeader(List<string> headers)
+        {
+            // Find the sheetdata of the worksheet
+            SheetData sd = (SheetData)currentWorkSheet.Where(x => x.LocalName == "sheetData").First();
+            Row header = new Row();
+            // increment the row index to the next row
+            header.RowIndex = Convert.ToUInt32(sd.ChildElements.Count()) + 1;
+
+            sd.Append(header); // Add the header row
+
+            foreach (string heading in headers)
+            {
+                AppendCell(header, header.RowIndex, heading, 3);
+
+            }
+
+            // save worksheet
+            currentWorkSheet.Save();
+        }
+
+        /// <summary>
+        /// Pass a list of data items to create a data row
+        /// </summary>
+        /// <param name="dataItems"></param>
+        public void AddRow(List<string> dataItems)
+        {
+            // Find the sheetdata of the worksheet
+            SheetData sd = (SheetData)currentWorkSheet.Where(x => x.LocalName == "sheetData").First();
+            Row header = new Row();
+            // increment the row index to the next row
+            header.RowIndex = Convert.ToUInt32(sd.ChildElements.Count()) + 1;
+            sd.Append(header);
+
+            foreach (string item in dataItems)
+            {
+                AppendCell(header, header.RowIndex, item, 4);
+
+            }
+
+            // save worksheet
+            currentWorkSheet.Save();
+        }
+
+        /// <summary>
+        /// Add cell into the passed row.
+        /// </summary>
+        /// <param name="row"></param>
+        /// <param name="rowIndex"></param>
+        /// <param name="value"></param>
+        /// <param name="styleIndex"></param>
+        public void AppendCell(Row row, uint rowIndex, string value, uint styleIndex)
+        {
+            Cell cell = new Cell();
+            cell.DataType = CellValues.InlineString;
+            cell.StyleIndex = styleIndex;  // Style index comes from stylesheet generated in GenerateStyleSheet()
+            Text t = new Text();
+            t.Text = value;
+
+            // Append Text to InlineString object
+            InlineString inlineString = new InlineString();
+            inlineString.AppendChild(t);
+
+            // Append InlineString to Cell
+            cell.AppendChild(inlineString);
+
+            // Get the last cell's column
+            string nextCol = "A";
+            Cell c = (Cell)row.LastChild;
+            if (c != null) // if there are some cells already there...
+            {
+                int numIndex = c.CellReference.ToString().IndexOfAny(new char[] { '1', '2', '3', '4', '5', '6', '7', '8', '9' });
+
+                // Get the last column reference
+                string lastCol = c.CellReference.ToString().Substring(0, numIndex);
+                // Increment
+                nextCol = IncrementColRef(lastCol);
+            }
+
+            cell.CellReference = nextCol + rowIndex;
+
+            row.AppendChild(cell);
+        }
+
+        // Increment the column reference in an Excel fashion, i.e. A, B, C...Z, AA, AB etc.
+        // Partly stolen from somewhere on the Net and modified for my use.
+        public string IncrementColRef(string lastRef)
+        {
+            char[] characters = lastRef.ToUpperInvariant().ToCharArray();
+            int sum = 0;
+            for (int i = 0; i < characters.Length; i++)
+            {
+                sum *= 26;
+                sum += (characters[i] - 'A' + 1);
+            }
+            sum++;
+            string columnName = String.Empty;
+            int modulo;
+            while (sum > 0)
+            {
+                modulo = (sum - 1) % 26;
+                columnName = Convert.ToChar(65 + modulo).ToString() + columnName;
+                sum = (int)((sum - modulo) / 26);
+            }
+            return columnName;
+
+        }
+
+        /// <summary>
+        /// Return a stylesheet. Completely stolen from somewhere, possibly this guy's blog,
+        /// although I can't find it on there:
+        /// http://polymathprogrammer.com/. Thanks whoever it was, it would have been a 
+        /// nightmare trying to figure this one out!
+        /// </summary>
+        /// <returns></returns>
+        public Stylesheet GenerateStyleSheet()
+        {
+            return new Stylesheet(
+                new Fonts(
+                    new Font(                                                               // Index 0 - The default font.
+                        new FontSize() { Val = 10 },
+                        new Color() { Rgb = new HexBinaryValue() { Value = "000000" } },
+                        new FontName() { Val = "sans-serif" }),
+                    new Font(                                                               // Index 1 - The bold font.
+                        new Bold(),
+                        new FontSize() { Val = 11 },
+                        new Color() { Rgb = new HexBinaryValue() { Value = "000000" } },
+                        new FontName() { Val = "sans-serif" }),
+                    new Font(                                                               // Index 2 - The Italic font.
+                        new Italic(),
+                        new FontSize() { Val = 11 },
+                        new Color() { Rgb = new HexBinaryValue() { Value = "000000" } },
+                        new FontName() { Val = "sans-serif" }),
+                    new Font(
+                        new Bold(),                                                       // Index 2 - The Times Roman font. with 16 size 0000FF
+                        new FontSize() { Val = 11 },
+                        new Color() { Rgb = new HexBinaryValue() { Value = "274713" } },
+                        new FontName() { Val = "sans-serif" })
+                ),
+                new Fills(
+                    new Fill(                                                           // Index 0 - The default fill.
+                        new PatternFill() { PatternType = PatternValues.DarkGrid }),
+                    new Fill(                                                           // Index 1 - The default fill of gray 125 (required)
+                        new PatternFill() { PatternType = PatternValues.DarkGrid }),
+                    new Fill(                                                           // Index 2 - The yellow fill. FFFFFF00
+                        new PatternFill(
+                            new ForegroundColor() { Rgb = new HexBinaryValue() { Value = "FFFFFF" } }
+                        )
+                        { PatternType = PatternValues.Solid })
+                ),
+                new Borders(
+                    new Border(                                                         // Index 0 - The default border.
+                        new LeftBorder(),
+                        new RightBorder(),
+                        new TopBorder(),
+                        new BottomBorder(),
+                        new DiagonalBorder()),
+                    new Border(                                                         // Index 1 - Applies a Left, Right, Top, Bottom border to a cell
+                        new LeftBorder(
+                            new Color() { Auto = true }
+                        )
+                        { Style = BorderStyleValues.Thin },
+                        new RightBorder(
+                            new Color() { Auto = true }
+                        )
+                        { Style = BorderStyleValues.Thin },
+                        new TopBorder(
+                            new Color() { Auto = true }
+                        )
+                        { Style = BorderStyleValues.Thin },
+                        new BottomBorder(
+                            new Color() { Auto = true }
+                        )
+                        { Style = BorderStyleValues.Thin },
+                        new DiagonalBorder())
+                ),
+                new CellFormats(
+                    new CellFormat() { FontId = 0, FillId = 0, BorderId = 0 },                          // Index 0 - The default cell style.  If a cell does not have a style index applied it will use this style combination instead
+                    new CellFormat() { FontId = 1, FillId = 2, BorderId = 1, ApplyFont = true, ApplyFill = true },       // Index 1 - Bold 
+                    new CellFormat() { FontId = 0, FillId = 0, BorderId = 0, ApplyFont = true },       // Index 2 - Italic
+                    new CellFormat() { FontId = 3, FillId = 0, BorderId = 0, ApplyFont = true },       // Index 3 - Times Roman
+                    new CellFormat() { FontId = 0, FillId = 2, BorderId = 1, ApplyFill = true, ApplyAlignment = true, ApplyBorder = true, ApplyFont = true },       // Index 4 - Yellow Fill
+                    new CellFormat(                                                                   // Index 5 - Alignment
+                        new Alignment() { Horizontal = HorizontalAlignmentValues.Center, Vertical = VerticalAlignmentValues.Center }
+                    )
+                    { FontId = 0, FillId = 0, BorderId = 0, ApplyAlignment = true },
+                    new CellFormat() { FontId = 0, FillId = 0, BorderId = 1, ApplyBorder = true }      // Index 6 - Border
+                )
+            ); // return
+        }
+
+
+
+        public string GetColumnName(string cellReference)
+        {
+            var regex = new Regex("[A-Za-z]+");
+            var match = regex.Match(cellReference);
+
+            return match.Value;
+        }
+
+        public int GetRowValue(string cellReference)
+        {
+            var regex = new Regex(@"\d+");
+            var match = regex.Match(cellReference);
+            return Convert.ToInt32(match.Value);
+        }
+
+        public int ConvertColumnNameToNumber(string columnName)
+        {
+            var alpha = new Regex("^[A-Z]+$");
+            if (!alpha.IsMatch(columnName))
+            {
+                throw new ArgumentException();
+            }
+            var colLetters = columnName.ToCharArray();
+            Array.Reverse(colLetters);
+
+            var convertedValue = 0;
+            for (var i = 0; i < colLetters.Length; i++)
+            {
+                var letter = colLetters[i];
+                var current = i == 0 ? letter - 65 : letter - 64;
+                convertedValue += current * (int)Math.Pow(26, i);
+            }
+
+            return convertedValue;
+        }
+
+        public IEnumerator<Cell> GetExcelCellEnumerator(Row row)
+        {
+            var currentCount = 0;
+            foreach (Cell cell in row.Descendants<Cell>())
+            {
+                var columnName = GetColumnName(cell.CellReference);
+
+                var currentColumnIndex = ConvertColumnNameToNumber(columnName);
+
+                for (; currentCount < currentColumnIndex; currentCount++)
+                {
+                    var emptycell = new Cell()
+                    {
+                        DataType = null,
+                        CellValue = new CellValue(string.Empty)
+                    };
+                    yield return emptycell;
+                }
+
+                yield return cell;
+                currentCount++;
+            }
+        }
+
+        public string ReadExcelCell(Cell cell, WorkbookPart workbookPart)
+        {
+            var cellValue = cell.CellValue;
+            var text = (cellValue == null) ? cell.InnerText : cellValue.Text;
+            if ((cell.DataType != null) && (cell.DataType == CellValues.SharedString))
+            {
+                text = workbookPart.SharedStringTablePart.SharedStringTable
+                    .Elements<SharedStringItem>().ElementAt(
+                        Convert.ToInt32(cell.CellValue.Text)).InnerText;
+            }
+
+            return (text ?? string.Empty).Trim();
+        }
+
+        //        string docName = @"C:\Users\Public\Documents\Sheet9.xlsx";
+        //string sheetName = "Jane";
+        //string cell1Name = "B2";
+        //string cell2Name = "C2";
+        //MergeTwoCells(docName, sheetName, cell1Name, cell2Name);
+
+
+
+
+
+
+
+        public void MergeTwoCells(string docName, string sheetName, string cell1Name, string cell2Name)
+        {
+            // Open the document for editing.
+            //using (SpreadsheetDocument document = SpreadsheetDocument.Open(docName, true))
+            //{
+            // Worksheet worksheet = currentWorkSheet;
+            if (currentWorkSheet == null || string.IsNullOrEmpty(cell1Name) || string.IsNullOrEmpty(cell2Name))
+            {
+                return;
+            }
+
+            // Verify if the specified cells exist, and if they do not exist, create them.
+            CreateSpreadsheetCellIfNotExist(currentWorkSheet, cell1Name);
+            CreateSpreadsheetCellIfNotExist(currentWorkSheet, cell2Name);
+
+            MergeCells mergeCells;
+            if (currentWorkSheet.Elements<MergeCells>().Count() > 0)
+            {
+                mergeCells = currentWorkSheet.Elements<MergeCells>().First();
+            }
+            else
+            {
+                mergeCells = new MergeCells();
+
+                // Insert a MergeCells object into the specified position.
+                if (currentWorkSheet.Elements<CustomSheetView>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<CustomSheetView>().First());
+                }
+                else if (currentWorkSheet.Elements<DataConsolidate>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<DataConsolidate>().First());
+                }
+                else if (currentWorkSheet.Elements<SortState>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<SortState>().First());
+                }
+                else if (currentWorkSheet.Elements<AutoFilter>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<AutoFilter>().First());
+                }
+                else if (currentWorkSheet.Elements<Scenarios>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<Scenarios>().First());
+                }
+                else if (currentWorkSheet.Elements<ProtectedRanges>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<ProtectedRanges>().First());
+                }
+                else if (currentWorkSheet.Elements<SheetProtection>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<SheetProtection>().First());
+                }
+                else if (currentWorkSheet.Elements<SheetCalculationProperties>().Count() > 0)
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<SheetCalculationProperties>().First());
+                }
+                else
+                {
+                    currentWorkSheet.InsertAfter(mergeCells, currentWorkSheet.Elements<SheetData>().First());
+                }
+            }
+
+            // Create the merged cell and append it to the MergeCells collection.
+            MergeCell mergeCell = new MergeCell() { Reference = new StringValue(cell1Name + ":" + cell2Name) };
+            mergeCells.Append(mergeCell);
+
+            currentWorkSheet.Save();
+            //}
+        }
+        // Given a Worksheet and a cell name, verifies that the specified cell exists.
+        // If it does not exist, creates a new cell. 
+        public void CreateSpreadsheetCellIfNotExist(Worksheet worksheet, string cellName)
+        {
+            string columnName = GetColumnName(cellName);
+            uint rowIndex = GetRowIndex(cellName);
+
+            IEnumerable<Row> rows = worksheet.Descendants<Row>().Where(r => r.RowIndex.Value == rowIndex);
+
+            // If the Worksheet does not contain the specified row, create the specified row.
+            // Create the specified cell in that row, and insert the row into the Worksheet.
+            if (rows.Count() == 0)
+            {
+                Row row = new Row() { RowIndex = new UInt32Value(rowIndex) };
+                Cell cell = new Cell() { CellReference = new StringValue(cellName) };
+                row.Append(cell);
+                worksheet.Descendants<SheetData>().First().Append(row);
+                worksheet.Save();
+            }
+            else
+            {
+                Row row = rows.First();
+
+                IEnumerable<Cell> cells = row.Elements<Cell>().Where(c => c.CellReference.Value == cellName);
+
+                // If the row does not contain the specified cell, create the specified cell.
+                if (cells.Count() == 0)
+                {
+                    Cell cell = new Cell() { CellReference = new StringValue(cellName) };
+                    row.Append(cell);
+                    worksheet.Save();
+                }
+            }
+        }
+
+        // Given a SpreadsheetDocument and a worksheet name, get the specified worksheet.
+        private static Worksheet GetWorksheet(SpreadsheetDocument document, string worksheetName)
+        {
+            IEnumerable<Sheet> sheets = document.WorkbookPart.Workbook.Descendants<Sheet>().Where(s => s.Name == worksheetName);
+            WorksheetPart worksheetPart = (WorksheetPart)document.WorkbookPart.GetPartById(sheets.First().Id);
+            if (sheets.Count() == 0)
+                return null;
+            else
+                return worksheetPart.Worksheet;
+        }
+
+        // Given a cell name, parses the specified cell to get the column name.
+
+        // Given a cell name, parses the specified cell to get the row index.
+        private static uint GetRowIndex(string cellName)
+        {
+            // Create a regular expression to match the row index portion the cell name.
+            Regex regex = new Regex(@"\d+");
+            Match match = regex.Match(cellName);
+
+            return uint.Parse(match.Value);
+        }
+    }
+}
